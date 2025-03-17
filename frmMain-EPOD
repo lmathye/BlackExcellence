@@ -1,0 +1,317 @@
+unit uMain;
+
+interface
+
+uses
+  System.SysUtils, System.Types, System.UITypes, System.Classes, System.Variants,
+  FMX.Types, FMX.Controls, FMX.Forms, FMX.Graphics, FMX.Dialogs, FMX.StdCtrls,
+  FMX.Controls.Presentation, FMX.ListBox, FMX.Layouts, FMX.Edit,
+  FireDAC.Comp.Client, FireDAC.Phys.SQLite, FireDAC.Stan.Param, FireDAC.DatS,
+  FireDAC.DApt.Intf, FireDAC.DApt, Data.DB, FireDAC.Comp.DataSet,
+  FireDAC.Phys.SQLiteWrapper.Stat, FireDAC.Stan.Intf, FireDAC.Stan.Option,
+  FireDAC.Stan.Error, FireDAC.UI.Intf, FireDAC.Phys.Intf, FireDAC.Stan.Def,
+  FireDAC.Stan.Pool, FireDAC.Stan.Async, FireDAC.Phys, FireDAC.Phys.SQLiteDef,
+  FireDAC.Stan.ExprFuncs, FireDAC.FMXUI.Wait, FMX.Menus, FMX.Header;
+
+type
+  TfrmMain = class(TForm)
+    lbDeliveries: TListBox;
+    edtItemCode: TEdit;
+    lblItemCode: TLabel;
+    FDConnection1: TFDConnection;
+    FDQuery1: TFDQuery;
+    FDPhysSQLiteDriverLink1: TFDPhysSQLiteDriverLink;
+    cbFilter: TComboBox;
+    mniFile: TMenuItem;
+    mniExportData: TMenuItem;
+    mniLogout: TMenuItem;
+    mniExit: TMenuItem;
+    mniDeliveries: TMenuItem;
+    mniViewDeliveries: TMenuItem;
+    mniAcceptJob: TMenuItem;
+    mniFulfillJob: TMenuItem;
+    mniTools: TMenuItem;
+    mniClearFields: TMenuItem;
+    mniHelp: TMenuItem;
+    mniAbout: TMenuItem;
+    StatusBar1: TStatusBar;
+    procedure FormCreate(Sender: TObject);
+    procedure cbFilterChange(Sender: TObject);
+    procedure mniExportDataClick(Sender: TObject);
+    procedure mniLogoutClick(Sender: TObject);
+    procedure mniExitClick(Sender: TObject);
+    procedure mniViewDeliveriesClick(Sender: TObject);
+    procedure mniAcceptJobClick(Sender: TObject);
+    procedure mniFulfillJobClick(Sender: TObject);
+    procedure mniClearFieldsClick(Sender: TObject);
+    procedure mniAboutClick(Sender: TObject);
+  private
+    procedure LoadDeliveries(const Status: string = 'Pending');
+    procedure AcceptDelivery(DeliveryID: Integer);
+    procedure InitializeDatabase;
+    procedure FulfillDelivery(DeliveryID: Integer);
+    procedure UpdateSignaturePath(DeliveryID: Integer; const SignaturePath: string);
+    procedure ExportDeliveriesToCSV;
+  public
+    FSelectedDeliveryID: Integer;
+  end;
+
+var
+  frmMain: TfrmMain;
+
+implementation
+
+{$R *.fmx}
+
+uses uLogin, uSignaturePad, System.IOUtils;
+
+procedure TfrmMain.FormCreate(Sender: TObject);
+begin
+  InitializeDatabase;
+  FSelectedDeliveryID := -1;
+  cbFilter.Items.Add('Pending');
+  cbFilter.Items.Add('Accepted');
+  cbFilter.Items.Add('Completed');
+  cbFilter.ItemIndex := 0;
+  LoadDeliveries(cbFilter.Selected.Text); // Load deliveries on form creation
+end;
+
+procedure TfrmMain.InitializeDatabase;
+var
+  DatabasePath: string;
+begin
+  try
+    {$IFDEF MSWINDOWS}
+    DatabasePath := 'C:\portable\sqlite\epod_pod2.db'; // Consider moving this to a config file
+    {$ENDIF}
+    {$IFDEF ANDROID or IOS}
+    DatabasePath := TPath.Combine(TPath.GetDocumentsPath, 'epod_pod2.db');
+    {$ENDIF}
+
+    if not TFile.Exists(DatabasePath) then
+    begin
+      ShowMessage('Database file not found: ' + DatabasePath);
+      Exit;
+    end;
+
+    FDConnection1.Params.Values['Database'] := DatabasePath;
+    FDConnection1.Connected := True;
+
+    FDConnection1.ExecSQL(
+      'CREATE TABLE IF NOT EXISTS Deliveries (' +
+      'DeliveryID INTEGER PRIMARY KEY AUTOINCREMENT, ' +
+      'CustomerName TEXT NOT NULL, ' +
+      'DeliveryAddress TEXT NOT NULL, ' +
+      'Status TEXT NOT NULL, ' +
+      'SignaturePath TEXT)');
+  except
+    on E: Exception do
+    begin
+      ShowMessage('Error initializing database: ' + E.Message);
+      Exit;
+    end;
+  end;
+end;
+
+procedure TfrmMain.cbFilterChange(Sender: TObject);
+begin
+  LoadDeliveries(cbFilter.Selected.Text);
+end;
+
+procedure TfrmMain.LoadDeliveries(const Status: string = 'Pending');
+var
+  Item: TListBoxItem;
+begin
+  lbDeliveries.Clear;
+  FDQuery1.SQL.Text := 'SELECT * FROM Deliveries WHERE Status = :Status';
+  FDQuery1.ParamByName('Status').AsString := Status;
+  FDQuery1.Open;
+  try
+    while not FDQuery1.Eof do
+    begin
+      Item := TListBoxItem.Create(lbDeliveries);
+      Item.Text :=
+        'ID: ' + FDQuery1.FieldByName('DeliveryID').AsString + ' | ' +
+        'Customer: ' + FDQuery1.FieldByName('CustomerName').AsString + ' | ' +
+        'Address: ' + FDQuery1.FieldByName('DeliveryAddress').AsString;
+      Item.Tag := FDQuery1.FieldByName('DeliveryID').AsInteger;
+      lbDeliveries.AddObject(Item);
+      FDQuery1.Next;
+    end;
+  finally
+    FDQuery1.Close;
+  end;
+end;
+
+procedure TfrmMain.mniExportDataClick(Sender: TObject);
+begin
+  ExportDeliveriesToCSV;
+end;
+
+procedure TfrmMain.ExportDeliveriesToCSV;
+var
+  CSVFile: TStringList;
+  FilePath: string;
+  SaveDialog: TSaveDialog;
+begin
+  SaveDialog := TSaveDialog.Create(nil);
+  try
+    SaveDialog.FileName := 'Deliveries_' + FormatDateTime('yyyy-mm-dd_hh-nn-ss', Now) + '.csv';
+    SaveDialog.Filter := 'CSV Files (*.csv)|*.csv';
+    if SaveDialog.Execute then
+    begin
+      FilePath := SaveDialog.FileName;
+      CSVFile := TStringList.Create;
+      try
+        CSVFile.Add('DeliveryID,CustomerName,DeliveryAddress,Status,SignaturePath');
+
+        FDQuery1.SQL.Text := 'SELECT * FROM Deliveries';
+        FDQuery1.Open;
+        try
+          while not FDQuery1.Eof do
+          begin
+            CSVFile.Add(Format('%d,%s,%s,%s,%s', [
+              FDQuery1.FieldByName('DeliveryID').AsInteger,
+              FDQuery1.FieldByName('CustomerName').AsString,
+              FDQuery1.FieldByName('DeliveryAddress').AsString,
+              FDQuery1.FieldByName('Status').AsString,
+              FDQuery1.FieldByName('SignaturePath').AsString
+            ]));
+            FDQuery1.Next;
+          end;
+        finally
+          FDQuery1.Close;
+        end;
+
+        CSVFile.SaveToFile(FilePath);
+        ShowMessage('Data exported to: ' + FilePath);
+      finally
+        CSVFile.Free;
+      end;
+    end;
+  finally
+    SaveDialog.Free;
+  end;
+end;
+
+procedure TfrmMain.mniLogoutClick(Sender: TObject);
+begin
+  if not Assigned(frmLogin) then
+    Application.CreateForm(TfrmLogin, frmLogin);
+  frmLogin.Show;
+  Hide;
+end;
+
+procedure TfrmMain.mniExitClick(Sender: TObject);
+begin
+  Close;
+end;
+
+procedure TfrmMain.mniViewDeliveriesClick(Sender: TObject);
+begin
+  LoadDeliveries(cbFilter.Selected.Text);
+end;
+
+procedure TfrmMain.mniAcceptJobClick(Sender: TObject);
+var
+  SelectedItem: TListBoxItem;
+  DeliveryID: Integer;
+begin
+  if lbDeliveries.ItemIndex >= 0 then
+  begin
+    SelectedItem := lbDeliveries.ListItems[lbDeliveries.ItemIndex] as TListBoxItem;
+    DeliveryID := SelectedItem.Tag;
+    AcceptDelivery(DeliveryID);
+    ShowMessage('Job accepted!');
+    LoadDeliveries(cbFilter.Selected.Text);
+  end
+  else
+  begin
+    ShowMessage('Please select a delivery job.');
+  end;
+end;
+
+procedure TfrmMain.AcceptDelivery(DeliveryID: Integer);
+begin
+  try
+    FDQuery1.SQL.Text := 'UPDATE Deliveries SET Status = :Status WHERE DeliveryID = :DeliveryID';
+    FDQuery1.ParamByName('Status').AsString := 'Accepted';
+    FDQuery1.ParamByName('DeliveryID').AsInteger := DeliveryID;
+    FDQuery1.ExecSQL;
+  except
+    on E: Exception do
+    begin
+      ShowMessage('Error accepting delivery: ' + E.Message);
+    end;
+  end;
+end;
+
+procedure TfrmMain.mniFulfillJobClick(Sender: TObject);
+var
+  SelectedItem: TListBoxItem;
+begin
+  if lbDeliveries.ItemIndex >= 0 then
+  begin
+    SelectedItem := lbDeliveries.ListItems[lbDeliveries.ItemIndex] as TListBoxItem;
+    FSelectedDeliveryID := SelectedItem.Tag;
+
+    if edtItemCode.Text = '' then
+    begin
+      ShowMessage('Please enter the item code manually.');
+      Exit;
+    end;
+
+    FulfillDelivery(FSelectedDeliveryID);
+  end
+  else
+  begin
+    ShowMessage('Please select a delivery job.');
+  end;
+end;
+
+procedure TfrmMain.FulfillDelivery(DeliveryID: Integer);
+begin
+  try
+    FDQuery1.SQL.Text := 'UPDATE Deliveries SET Status = :Status WHERE DeliveryID = :DeliveryID';
+    FDQuery1.ParamByName('Status').AsString := 'Completed';
+    FDQuery1.ParamByName('DeliveryID').AsInteger := DeliveryID;
+    FDQuery1.ExecSQL;
+
+    if not Assigned(frmSignaturePad) then
+      Application.CreateForm(TfrmSignaturePad, frmSignaturePad);
+    frmSignaturePad.Show;
+  except
+    on E: Exception do
+    begin
+      ShowMessage('Error fulfilling delivery: ' + E.Message);
+    end;
+  end;
+end;
+
+procedure TfrmMain.UpdateSignaturePath(DeliveryID: Integer; const SignaturePath: string);
+begin
+  try
+    FDQuery1.SQL.Text := 'UPDATE Deliveries SET SignaturePath = :SignaturePath WHERE DeliveryID = :DeliveryID';
+    FDQuery1.ParamByName('SignaturePath').AsString := SignaturePath;
+    FDQuery1.ParamByName('DeliveryID').AsInteger := DeliveryID;
+    FDQuery1.ExecSQL;
+  except
+    on E: Exception do
+    begin
+      ShowMessage('Error updating signature path: ' + E.Message);
+    end;
+  end;
+end;
+
+procedure TfrmMain.mniClearFieldsClick(Sender: TObject);
+begin
+  edtItemCode.Text := '';
+  lbDeliveries.Clear;
+end;
+
+procedure TfrmMain.mniAboutClick(Sender: TObject);
+begin
+  ShowMessage('EPOD App v1.0' + #13#10 + '© 2023 Your Company');
+end;
+
+end.
